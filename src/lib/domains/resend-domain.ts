@@ -2,13 +2,14 @@ import { createDnsRecord, deleteDnsRecord, listDnsRecords } from "@/lib/cloudfla
 import { isManualZone } from "@/lib/domains/provision";
 import { getResendKeyStatus, getResendClient } from "@/lib/email/outbound-provider";
 import { createResendDomain, deleteResendDomain, findResendDomain, getResendDomain, resendClient, updateResendCapabilities, verifyResendDomain, type ResendClient } from "@/lib/email/resend-api";
-import { isInboundSmtpMx } from "@/lib/domains/receiving-dns";
+import { isResendInboundMx } from "@/lib/domains/receiving-dns";
 import type { ResendDomain, ResendDomainRecord } from "@/lib/email/resend-api-types";
 import type { DomainRow } from "@/lib/domains/types";
 import type { ResendDomainView } from "@/lib/domains/resend-domain-types";
 
 /** Records for sending only; the apex MX for receiving belongs to the receiving setup. */
-const sendingRecords = (records: ResendDomainRecord[] | undefined) => (records ?? []).filter((record) => !(record.type === "MX" && isInboundSmtpMx(record.value)));
+const sendingRecords = (records: ResendDomainRecord[] | undefined) =>
+	(records ?? []).filter((record) => !(record.type === "MX" && (record.record === "Receiving" || isResendInboundMx(record.value))));
 
 function toView(domain: ResendDomain | null, zoneManaged: boolean, missingDns: number | null = null): ResendDomainView {
 	return {
