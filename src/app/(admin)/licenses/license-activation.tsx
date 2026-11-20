@@ -1,8 +1,9 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { confirmDestructive } from "@/components/ui/confirm-dialog";
 import type { ReactNode } from "react";
-import { CheckCircle2 } from "lucide-react";
+import { CheckCircle2 } from "@/components/icons";
 import { useLanguage } from "@/components/language-provider";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -46,7 +47,7 @@ export function LicenseActivation({ children }: { children?: ReactNode }) {
 			setStatus(t("licenses.enterKey"));
 			return;
 		}
-		if (nextAction === "deactivate" && !window.confirm(t("licenses.deactivateConfirm"))) return;
+		if (nextAction === "deactivate" && !await confirmDestructive(t("licenses.deactivateConfirm"))) return;
 
 		setAction(nextAction);
 		setStatus(null);

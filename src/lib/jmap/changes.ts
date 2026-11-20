@@ -1,6 +1,7 @@
 import { and, asc, eq, gt, inArray, sql } from "drizzle-orm";
 import { getDb, type AppDatabase } from "@/db";
 import { jmapChangeFloor, jmapChanges, messages } from "@/db/schema";
+import { greatest } from "@/db/sql";
 import { listFoldersByMailbox, listJmapMailboxes } from "./access";
 import { encodeMailboxRef, SYSTEM_ROLES } from "./ids";
 import type { AccessibleMailbox, JmapContext } from "./types";
@@ -23,16 +24,19 @@ async function floorSeq(ctx: JmapContext): Promise<number> {
 	return row?.seq ?? 0;
 }
 
-/** Newest sequence per mailbox, one indexed MAX per mailbox. */
+/**
+ * Newest sequence per mailbox, one indexed MAX per mailbox. D1 allows at most 5 terms in a
+ * compound SELECT, so the chunks run concurrently: one after another costs a round trip each.
+ */
 async function latestSeq(ctx: JmapContext, mailboxIds: string[]): Promise<number> {
-	let latest = 0;
-	for (let offset = 0; offset < mailboxIds.length; offset += 50) {
-		const chunk = mailboxIds.slice(offset, offset + 50);
-		const parts = chunk.map((id) => sql`SELECT (SELECT max(seq) FROM jmap_changes WHERE mailbox_id = ${id}) AS seq`);
-		const rows = await ctx.db.all<{ seq: number | null }>(sql.join(parts, sql` UNION ALL `));
-		for (const row of rows) latest = Math.max(latest, row.seq ?? 0);
-	}
-	return latest;
+	const chunks: string[][] = [];
+	for (let offset = 0; offset < mailboxIds.length; offset += 5) chunks.push(mailboxIds.slice(offset, offset + 5));
+	const results = await Promise.all(
+		chunks.map((chunk) =>
+			ctx.db.all<{ seq: number | null }>(sql.join(chunk.map((id) => sql`SELECT (SELECT max(seq) FROM jmap_changes WHERE mailbox_id = ${id}) AS seq`), sql` UNION ALL `)),
+		),
+	);
+	return Math.max(0, ...results.flat().map((row) => row.seq ?? 0));
 }
 
 export type ChangeScope = {
@@ -42,7 +46,20 @@ export type ChangeScope = {
 	state: string;
 };
 
-export async function currentChangeScope(ctx: JmapContext): Promise<ChangeScope> {
+export function currentChangeScope(ctx: JmapContext): Promise<ChangeScope> {
+	if (ctx.memo === null) return loadChangeScope(ctx);
+	const memo = (ctx.memo ??= {});
+	if (!memo.scope) {
+		const pending = loadChangeScope(ctx);
+		memo.scope = pending;
+		pending.catch(() => {
+			if (memo.scope === pending) memo.scope = undefined;
+		});
+	}
+	return memo.scope;
+}
+
+async function loadChangeScope(ctx: JmapContext): Promise<ChangeScope> {
 	const mailboxes = await listJmapMailboxes(ctx);
 	const [seq, fingerprint, floor] = await Promise.all([latestSeq(ctx, mailboxes.map((m) => m.id)), accessFingerprint(mailboxes), floorSeq(ctx)]);
 	const effective = Math.max(seq, floor);
@@ -121,8 +138,10 @@ export async function threadChangesSince(ctx: JmapContext, args: Record<string, 
 	const ids = result.scope.mailboxes.map((m) => m.id);
 	const threadKey = sql<string>`coalesce(${messages.threadId}, ${messages.id})`;
 	const alive = new Set<string>();
-	for (let offset = 0; offset < threads.length; offset += 100) {
-		const chunk = threads.slice(offset, offset + 100);
+	// D1 allows 100 bound parameters per statement: the mailbox ids share them with the thread ids.
+	const threadChunk = Math.max(1, 100 - ids.length);
+	for (let offset = 0; offset < threads.length; offset += threadChunk) {
+		const chunk = threads.slice(offset, offset + threadChunk);
 		const rows = await ctx.db
 			.selectDistinct({ thread: threadKey })
 			.from(messages)
@@ -187,7 +206,7 @@ export async function pruneJmapChanges(db: AppDatabase, now = Date.now()): Promi
 	const [row] = await db.all<{ seq: number | null }>(sql`SELECT max(seq) AS seq FROM jmap_changes WHERE created_at < ${cutoff}`);
 	const floor = row?.seq ?? 0;
 	if (!floor) return 0;
-	await db.run(sql`UPDATE jmap_change_floor SET seq = max(seq, ${floor}) WHERE id = 1`);
+	await db.run(sql`UPDATE jmap_change_floor SET seq = ${greatest(sql`seq`, floor)} WHERE id = 1`);
 	const deleted = await db.run(sql`DELETE FROM jmap_changes WHERE seq <= ${floor}`);
 	return Number((deleted as { meta?: { changes?: number } }).meta?.changes ?? 0);
 }

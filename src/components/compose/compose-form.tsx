@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { DragEvent } from "react";
-import { ChevronUp, FileText, Forward, Maximize2, Minimize2, Minus, Paperclip, Reply, Trash2, X } from "lucide-react";
+import { BellRing, ChevronUp, Eye, EyeOff, FileText, Forward, Maximize2, Minimize2, Minus, Paperclip, Reply, Trash2, X } from "@/components/icons";
 import { useRouter } from "next/navigation";
 import { useLanguage } from "@/components/language-provider";
 import { Button } from "@/components/ui/button";
@@ -13,17 +13,24 @@ import { Tooltip } from "@/components/ui/tooltip";
 import { useSelectedMailbox } from "@/components/mailbox-provider";
 import { authFetch } from "@/lib/auth/client";
 import { formatEmailAddress, getEmailAddress } from "@/lib/email/address";
+import { clearMessageDetailCache } from "@/lib/messages/detail-cache";
 import { useCompose } from "@/components/compose/compose-context";
 import { cn } from "@/lib/utils";
 import { SendReview } from "@/components/agent/send-review";
 import type { ReviewSnapshot } from "@/components/agent/send-review-types";
 import { useIsMobile } from "@/components/sidebar-mobile-utils";
 import { useSheetViewport } from "./use-sheet-viewport";
+import { useTrackOpens } from "./use-track-opens";
+import { FollowUpMenu } from "@/components/follow-ups/follow-up-menu";
+import { followUpOptionKey } from "@/components/follow-ups/follow-up-client-utils";
+import { formatScheduledSendTime } from "@/components/messages/scheduled-send-utils";
 import { buildSendFormData, fetchDraft, formatAttachmentSize } from "./utils";
 import { RecipientInput } from "./recipient-input";
 import { RichTextEditor } from "./rich-text-editor";
 import { ScheduleSendMenu } from "./schedule-send-menu";
 import { isPastSchedule } from "./schedule-send-utils";
+import { DELIVERY_WAIT_MS, SCHEDULED_NOTICE_MS, SENT_NOTICE_MS, resolveSendNotice, splitSendTemplate } from "./send-notice-utils";
+import type { SendNoticeParts, SendResult } from "./send-notice-utils";
 import {
 	applyMailboxSignatureHtml,
 	hasMeaningfulHtml,
@@ -32,7 +39,7 @@ import {
 	splitQuotedHtml,
 	textToHtml,
 } from "./rich-text-utils";
-import { headerToRecipients, isValidRecipient, recipientsToHeader } from "./recipient-utils";
+import { headerToRecipients, isValidRecipient, mergeRecipients, recipientsToHeader } from "./recipient-utils";
 import type { ComposeAttachment, ComposeStoredAttachment, ComposeThreading } from "./types";
 import type { ComposeAttachmentPolicy } from "./attachment-policy-types";
 
@@ -41,20 +48,24 @@ type Toast = { type: "success" | "error"; message: string } | null;
 export function ComposeForm({
 	mode = "page",
 	draftIdToLoad,
+	initialTo,
 	onClose,
 }: {
 	mode?: "page" | "popup";
 	draftIdToLoad?: string | null;
+	/** Recipients a fresh composer starts with, e.g. from the Contacts page. */
+	initialTo?: string[] | null;
 	onClose?: () => void;
 }) {
 	const { t } = useLanguage();
 	const router = useRouter();
-	const { showNotice, openDraftComposer } = useCompose();
+	const { showNotice, openDraftComposer, isCurrentNotice } = useCompose();
 	const { selectedMailbox, setSelectedMailbox, mailboxes } = useSelectedMailbox();
 	const [draftId, setDraftId] = useState<string | null>(null);
 	const [agentRevision, setAgentRevision] = useState<number | null>(null);
 	const [agentReview, setAgentReview] = useState<{ approvalId: string; snapshot: ReviewSnapshot } | null>(null);
-	const [to, setTo] = useState<string[]>([]);
+	// Recipients handed in by the caller (Contacts "Send email", etc.) seed a fresh composer.
+	const [to, setTo] = useState<string[]>(() => (draftIdToLoad ? [] : mergeRecipients([], initialTo ?? [])));
 	const [cc, setCc] = useState<string[]>([]);
 	const [bcc, setBcc] = useState<string[]>([]);
 	const [showCc, setShowCc] = useState(false);
@@ -76,6 +87,8 @@ export function ComposeForm({
 	const [loadingDraft, setLoadingDraft] = useState(false);
 	const [deletingDraft, setDeletingDraft] = useState(false);
 	const [scheduledAt, setScheduledAt] = useState<Date | null>(null);
+	const [trackOpens, setTrackOpens] = useTrackOpens();
+	const [followUpDays, setFollowUpDays] = useState<number | null>(null);
 	const [loadedDraftMailboxId, setLoadedDraftMailboxId] = useState<string | null>(null);
 	const [loadedDraftFrom, setLoadedDraftFrom] = useState<string | null>(null);
 	const [selectedFrom, setSelectedFrom] = useState("");
@@ -86,6 +99,7 @@ export function ComposeForm({
 	const [closing, setClosing] = useState(false);
 	const dragStart = useRef<number | null>(null);
 	const [dragY, setDragY] = useState(0);
+	const noticeActionInFlight = useRef(false);
 
 	// Phones: slide the sheet away and let the page behind grow back before unmounting.
 	function dismiss() {
@@ -110,6 +124,13 @@ export function ComposeForm({
 	const pendingSave = useRef<(() => Promise<void>) | null>(null);
 	const draftGeneration = useRef(0);
 	const draftIdRef = useRef<string | null>(null);
+	const agentRevisionRef = useRef(agentRevision);
+	useEffect(() => {
+		agentRevisionRef.current = agentRevision;
+	}, [agentRevision]);
+	// A pending human send review owns this snapshot. Autosaving after creating
+	// an approval increments its revision and makes confirmation impossible.
+	const reviewInProgressRef = useRef(false);
 	const saveQueue = useRef<Promise<void>>(Promise.resolve());
 	const uploadedFiles = useRef(new WeakSet<File>());
 	const rejectedFiles = useRef(new WeakSet<File>());
@@ -144,17 +165,20 @@ export function ComposeForm({
 		}),
 		[mailboxes],
 	);
+	// Keep the sender on an address the mailbox can send as. A loaded draft's
+	// sender wins whenever it or the mailbox's addresses change.
+	const [prevSenderSync, setPrevSenderSync] = useState({ loadedDraftFrom, senderAddresses });
+	let nextFrom = selectedFrom;
+	if (loadedDraftFrom !== prevSenderSync.loadedDraftFrom || senderAddresses !== prevSenderSync.senderAddresses) {
+		setPrevSenderSync({ loadedDraftFrom, senderAddresses });
+		if (loadedDraftFrom && senderAddresses.includes(loadedDraftFrom)) nextFrom = loadedDraftFrom;
+	}
+	if (!senderAddresses.length) nextFrom = "";
+	else if (!senderAddresses.includes(nextFrom)) nextFrom = senderAddresses[0];
+	if (nextFrom !== selectedFrom) setSelectedFrom(nextFrom);
 	const fromAddr = selectedMailbox && selectedFrom
 		? formatEmailAddress(selectedFrom, selectedMailbox.displayName)
 		: "";
-
-	useEffect(() => {
-		if (!senderAddresses.length) {
-			setSelectedFrom("");
-			return;
-		}
-		if (!senderAddresses.includes(selectedFrom)) setSelectedFrom(senderAddresses[0]);
-	}, [selectedFrom, senderAddresses]);
 
 	useEffect(() => {
 		if (!toast) return;
@@ -166,6 +190,7 @@ export function ComposeForm({
 		if (!draftIdToLoad) return;
 
 		let cancelled = false;
+		// eslint-disable-next-line react-hooks/set-state-in-effect -- flags the fetch below as in flight; the signature and autosave effects rely on it flipping after the first commit.
 		setLoadingDraft(true);
 		fetchDraft(draftIdToLoad)
 			.then((draft) => {
@@ -222,11 +247,6 @@ export function ComposeForm({
 	}, [loadedDraftMailboxId, mailboxes, selectedMailbox?.id, setSelectedMailbox]);
 
 	useEffect(() => {
-		if (!loadedDraftFrom || !senderAddresses.includes(loadedDraftFrom)) return;
-		setSelectedFrom(loadedDraftFrom);
-	}, [loadedDraftFrom, senderAddresses]);
-
-	useEffect(() => {
 		if (loadingDraft) return;
 		const nextSignature = selectedMailbox?.signature ?? "";
 		setHtml((current) => applyMailboxSignatureHtml(current, previousSignature.current, nextSignature));
@@ -240,16 +260,18 @@ export function ComposeForm({
 	useEffect(() => {
 		pendingSave.current = null;
 		const bodyContent = htmlToPlainText(html).trim();
-		const signatureOnly = bodyContent === (selectedMailbox?.signature?.trim() ?? "");
+		// Compare text with text: an HTML signature is stored as markup.
+		const signatureContent = htmlToPlainText(applyMailboxSignatureHtml("", "", selectedMailbox?.signature)).trim();
+		const signatureOnly = bodyContent === signatureContent;
 		const hasContent =
 			to.length > 0 || cc.length > 0 || bcc.length > 0 || subject.trim() || quotedHtml || attachments.length > 0 || (bodyContent && !signatureOnly);
-		if (!fromAddr || !hasContent || loadingDraft) return;
+		if (!fromAddr || !hasContent || loadingDraft || reviewInProgressRef.current) return;
 		if (saveTimer.current) clearTimeout(saveTimer.current);
 
 		const generation = draftGeneration.current;
 		const save = () => {
 			const run = saveQueue.current.then(async () => {
-				if (generation !== draftGeneration.current) return;
+				if (generation !== draftGeneration.current || reviewInProgressRef.current) return;
 				const payload = {
 					mailboxId: selectedMailbox?.id,
 					from: fromAddr,
@@ -278,7 +300,7 @@ export function ComposeForm({
 				draftIdRef.current = data.draft.id;
 				setDraftId(data.draft.id);
 				const pending = attachments.filter((attachment) => !uploadedFiles.current.has(attachment.file) && !rejectedFiles.current.has(attachment.file));
-				if (agentRevision !== null || pending.length === 0) return;
+				if (agentRevisionRef.current !== null || pending.length === 0) return;
 				const form = new FormData();
 				for (const attachment of pending) form.append("attachments", attachment.file);
 				const uploaded = await authFetch(`/api/drafts/${data.draft.id}/attachments`, { method: "POST", body: form });
@@ -304,7 +326,7 @@ export function ComposeForm({
 		return () => {
 			if (saveTimer.current) clearTimeout(saveTimer.current);
 		};
-	}, [agentRevision, attachments, bcc, cc, fromAddr, html, loadingDraft, quotedHtml, selectedMailbox?.id, selectedMailbox?.signature, subject, threading, to]);
+	}, [attachments, bcc, cc, fromAddr, html, loadingDraft, quotedHtml, selectedMailbox?.id, selectedMailbox?.signature, subject, threading, to]);
 
 	useEffect(() => {
 		if (!draftIdToLoad || loadingDraft) return;
@@ -330,6 +352,9 @@ export function ComposeForm({
 			setToast({ type: "error", message: t("schedule.pastTime") });
 			return;
 		}
+		// Freeze autosave for an AI draft before waiting for any queued save.
+		// Otherwise a debounced PATCH can invalidate the approval snapshot.
+		if (draftId && agentRevision !== null) reviewInProgressRef.current = true;
 		if (saveTimer.current) clearTimeout(saveTimer.current);
 		pendingSave.current = null;
 		setLoading(true);
@@ -358,12 +383,15 @@ export function ComposeForm({
 				const result = await response.json() as { approvalId?: string; snapshot?: ReviewSnapshot; error?: string };
 				if (!response.ok || !result.approvalId || !result.snapshot) throw new Error(result.error || t("compose.error.createReview"));
 				setAgentReview({ approvalId: result.approvalId, snapshot: result.snapshot });
-			} catch (cause) { setToast({ type: "error", message: cause instanceof Error ? cause.message : t("compose.error.reviewDraft") }); }
+			} catch (cause) {
+				reviewInProgressRef.current = false;
+				setToast({ type: "error", message: cause instanceof Error ? cause.message : t("compose.error.reviewDraft") });
+			}
 			finally { setLoading(false); }
 			return;
 		}
 		let res: Response;
-		let data: { messageId?: string; scheduled?: boolean; undoSeconds?: number; error?: string };
+		let data: SendResult & { error?: string };
 		try {
 			res = await authFetch("/api/send", {
 				method: "POST",
@@ -381,9 +409,11 @@ export function ComposeForm({
 					draftId,
 					scheduledAt,
 					undoSend: true,
+					trackOpens,
+					followUpDays,
 				}),
 			});
-			data = (await res.json()) as { messageId?: string; scheduled?: boolean; undoSeconds?: number; error?: string };
+			data = (await res.json()) as SendResult & { error?: string };
 		} catch {
 			setLoading(false);
 			setToast({ type: "error", message: t("compose.error.sendFailed") });
@@ -396,11 +426,9 @@ export function ComposeForm({
 			return;
 		}
 
-		if (currentDraftId) {
-			void authFetch(`/api/drafts/${currentDraftId}`, { method: "DELETE" }).finally(() => {
-				window.dispatchEvent(new Event("mailflare:messages-changed"));
-			});
-		}
+		// With a draft, refresh once it is gone so the lists reload a single time.
+		const refreshLists = () => window.dispatchEvent(new Event("mailflare:messages-changed"));
+		if (currentDraftId) void authFetch(`/api/drafts/${currentDraftId}`, { method: "DELETE" }).finally(refreshLists);
 		draftGeneration.current += 1;
 		draftIdRef.current = null;
 		setDraftId(null);
@@ -416,19 +444,41 @@ export function ComposeForm({
 		setQuotedHtml(null);
 		setAttachments([]);
 		setScheduledAt(null);
-		const sentMessageId = data.messageId;
-		if (data.undoSeconds && sentMessageId) {
-			// The send is queued for the undo window; Cancel puts the message back in Drafts and reopens it.
-			showNotice(t("compose.sent"), {
-				durationMs: data.undoSeconds * 1000,
-				action: { label: t("compose.cancelSend"), onClick: () => void cancelSend(sentMessageId) },
-			});
-			// Refresh the lists once the queue has had time to deliver it.
-			setTimeout(() => window.dispatchEvent(new Event("mailflare:messages-changed")), (data.undoSeconds + 3) * 1000);
+		const notice = resolveSendNotice(data);
+		const subjectLabel = subject.trim() || t("list.noSubject");
+		if (notice.kind === "undo") {
+			const content = buildSubjectNotice("compose.sendingIn", subjectLabel, notice.messageId, true);
+			let undoNoticeId = 0;
+			// The send is queued for the undo window; Undo returns it to Drafts and Send now skips the wait.
+			undoNoticeId = showNotice(content.message, {
+				parts: content.parts,
+				durationMs: notice.durationMs,
+				countdown: { endAt: notice.endAt },
+				// Delivery starts after the window; keep watching until the queue reports a result.
+				onCountdownEnd: () => {
+					if (!isCurrentNotice(undoNoticeId) || noticeActionInFlight.current) return;
+					showSendingNotice(notice.messageId, subjectLabel);
+				},
+				actions: [
+					{ label: t("compose.undoSend"), onClick: () => cancelSend(notice.messageId, "undo", undoNoticeId) },
+					{ label: t("compose.sendNow"), onClick: () => sendNow(notice.messageId, subjectLabel, undoNoticeId) },
+				],
+			}) ?? 0;
+		} else if (notice.kind === "sending") {
+			showSendingNotice(notice.messageId, subjectLabel);
+		} else if (notice.kind === "scheduled") {
+			const message = notice.scheduledAt
+				? t("schedule.sendScheduledFor", { when: formatScheduledSendTime(notice.scheduledAt, t) })
+				: t("compose.scheduled");
+			let scheduledNoticeId = 0;
+			scheduledNoticeId = showNotice(message, {
+				durationMs: SCHEDULED_NOTICE_MS,
+				actions: [{ label: t("schedule.cancelSend"), onClick: () => cancelSend(notice.messageId, "scheduled", scheduledNoticeId) }],
+			}) ?? 0;
 		} else {
-			showNotice(data.scheduled ? t("compose.scheduled") : t("compose.sent"));
+			showNotice(t("compose.sent"));
 		}
-		window.dispatchEvent(new Event("mailflare:messages-changed"));
+		if (!currentDraftId) refreshLists();
 
 		if (onClose) {
 			dismiss();
@@ -437,18 +487,120 @@ export function ComposeForm({
 		router.push("/sent");
 	}
 
-	async function cancelSend(messageId: string) {
+	/**
+	 * Splits a translated template around {subject} so the subject can link to the
+	 * message, and around {seconds} so only the ticking suffix changes. Passing the
+	 * placeholders back as values leaves them intact for the split.
+	 *
+	 * A message that is still queued is listed under Scheduled; only a delivered one
+	 * lives in Sent, so the link follows the message's state.
+	 */
+	function buildSubjectNotice(
+		key: "compose.sendingIn" | "compose.sendingSubject" | "compose.sentSubject",
+		subjectLabel: string,
+		messageId: string,
+		countdown: boolean,
+	): { message: string; parts: SendNoticeParts } {
+		const template = t(key, { subject: "{subject}", seconds: "{seconds}" });
+		const href = key === "compose.sentSubject" ? `/sent/${messageId}` : `/scheduled/${messageId}`;
+		const parts: SendNoticeParts = {
+			...splitSendTemplate(template, countdown),
+			link: { label: subjectLabel, href },
+		};
+		return { message: t(key, { subject: subjectLabel, seconds: 1 }), parts };
+	}
+
+	/** Shows the message while the queue delivers it and watches for the final status. */
+	function showSendingNotice(messageId: string, subjectLabel: string): number {
+		const content = buildSubjectNotice("compose.sendingSubject", subjectLabel, messageId, false);
+		let noticeId = 0;
+		noticeId = showNotice(content.message, {
+			parts: content.parts,
+			durationMs: DELIVERY_WAIT_MS,
+			poll: {
+				messageId,
+				onStatus: (status) => {
+					if (status === "sent") {
+						// Delivered: refresh the lists even if a newer toast has taken over.
+						showSentNotice(messageId, subjectLabel, noticeId);
+						return;
+					}
+					if (!isCurrentNotice(noticeId)) return;
+					if (status === "failed") showNotice(t("compose.error.sendFailed"), { tone: "error" });
+					else showNotice(null);
+				},
+			},
+		}) ?? 0;
+		return noticeId;
+	}
+
+	function showSentNotice(messageId: string, subjectLabel: string, sourceNoticeId: number) {
+		// The message is delivered, so the lists and the cached detail are stale
+		// whichever toast is on screen; refresh them before the notice check.
+		clearMessageDetailCache();
+		window.dispatchEvent(new Event("mailflare:messages-changed"));
+		if (!isCurrentNotice(sourceNoticeId)) return;
+		const content = buildSubjectNotice("compose.sentSubject", subjectLabel, messageId, false);
+		showNotice(content.message, { parts: content.parts, durationMs: SENT_NOTICE_MS });
+	}
+
+	async function sendNow(messageId: string, subjectLabel: string, sourceNoticeId: number) {
+		if (noticeActionInFlight.current) return;
+		noticeActionInFlight.current = true;
+		try {
+			const response = await authFetch(`/api/messages/${messageId}/send-now`, { method: "POST" });
+			if (response.ok) {
+				// The message is on its way: refresh the lists even if a newer toast has taken over.
+				showSentNotice(messageId, subjectLabel, sourceNoticeId);
+				return;
+			}
+			if (!isCurrentNotice(sourceNoticeId)) return;
+			if (response.status === 409) {
+				// The queued delivery claimed the message first; watch it instead of failing.
+				showSendingNotice(messageId, subjectLabel);
+				return;
+			}
+			if (response.status >= 500) {
+				// The request may have failed before claiming the job; the scheduled send can
+				// still deliver later, so let the status poll decide instead of reporting failure.
+				showSendingNotice(messageId, subjectLabel);
+				return;
+			}
+			const result = await response.json().catch(() => ({})) as { error?: string };
+			if (!isCurrentNotice(sourceNoticeId)) return;
+			showNotice(result.error ?? t("compose.error.sendFailed"), { tone: "error" });
+		} catch {
+			// A dropped response is ambiguous: the message may still be on its way.
+			if (isCurrentNotice(sourceNoticeId)) showSendingNotice(messageId, subjectLabel);
+		} finally {
+			noticeActionInFlight.current = false;
+		}
+	}
+
+	async function cancelSend(messageId: string, source: "undo" | "scheduled", sourceNoticeId: number) {
+		if (noticeActionInFlight.current) return;
+		noticeActionInFlight.current = true;
 		try {
 			const res = await authFetch(`/api/messages/${messageId}/cancel-schedule`, { method: "POST" });
 			if (!res.ok) {
-				showNotice(t("compose.cancelTooLate"));
+				if (!isCurrentNotice(sourceNoticeId)) return;
+				// A 409 on the undo toast means the queue claimed it; a scheduled send can also fail for other reasons.
+				showNotice(source === "undo" && res.status === 409 ? t("compose.cancelTooLate") : t("schedule.cancelFailed"), {
+					tone: "error",
+				});
 				return;
 			}
-			showNotice(t("compose.sendCancelled"));
+			// The message is back in Drafts, so the lists and the cached detail are
+			// stale whichever toast is on screen; refresh them before the notice check.
+			clearMessageDetailCache();
 			window.dispatchEvent(new Event("mailflare:messages-changed"));
+			if (!isCurrentNotice(sourceNoticeId)) return;
+			showNotice(t("compose.sendCancelled"));
 			openDraftComposer(messageId);
 		} catch {
-			showNotice(t("compose.cancelTooLate"));
+			if (isCurrentNotice(sourceNoticeId)) showNotice(t("schedule.cancelFailed"), { tone: "error" });
+		} finally {
+			noticeActionInFlight.current = false;
 		}
 	}
 
@@ -637,20 +789,21 @@ export function ComposeForm({
 
 	return (
 		<>
-			{agentReview && <SendReview approvalId={agentReview.approvalId} snapshot={agentReview.snapshot} onClose={() => setAgentReview(null)} onSent={() => { setAgentReview(null); if (onClose) dismiss(); else router.push("/sent"); }} />}
-			{mode === "popup" && modalMode && !minimized && <div className="fixed inset-0 z-40 bg-neutral-950/65" aria-hidden="true" />}
+			{agentReview && <SendReview approvalId={agentReview.approvalId} snapshot={agentReview.snapshot} onClose={() => { reviewInProgressRef.current = false; setAgentReview(null); }} onSent={() => { reviewInProgressRef.current = false; setAgentReview(null); if (onClose) dismiss(); else router.push("/sent"); }} />}
+			{mode === "popup" && modalMode && !minimized && <div className="fixed inset-0 z-40 bg-black/65 dark:bg-black/75" aria-hidden="true" />}
 			{toast && (
 				<div
 					role={toast.type === "error" ? "alert" : "status"}
 					className={cn(
-						"fixed right-6 top-6 z-[60] rounded-lg px-4 py-3 text-sm font-medium shadow-lg",
+						"fixed z-[60] max-w-[calc(100vw-3rem)] rounded-lg px-4 py-3 text-sm font-medium shadow-lg",
+						"inset-x-6 bottom-[max(5rem,calc(env(safe-area-inset-bottom,0px)+4.5rem))] md:bottom-6 md:[inset-inline-end:auto] md:[inset-inline-start:calc(var(--sidebar-width,260px)+1.5rem)]",
 						toast.type === "success" ? "bg-green-600 text-white" : "bg-red-600 text-white",
 					)}
 				>
 					{toast.message}
 				</div>
 			)}
-			<form onSubmit={onSubmit} className={cn(frameClass, closing && "compose-sheet-closing")} style={dragY ? { transform: `translateY(${dragY}px)`, transition: "none" } : undefined} ref={formRef} role={modalMode && !minimized ? "dialog" : mode === "popup" ? "region" : undefined} aria-modal={modalMode && !minimized || undefined} aria-label={mode === "popup" ? t("compose.dialogLabel") : undefined} onKeyDown={(event) => { if (modalMode && !minimized && event.key === "Escape") { event.preventDefault(); setModalMode(false); } }} onDragEnterCapture={minimized ? undefined : onFileDragEnter} onDragOverCapture={minimized ? undefined : onFileDragOver} onDragLeaveCapture={minimized ? undefined : onFileDragLeave} onDropCapture={minimized ? undefined : onFileDrop}>
+			<form onSubmit={onSubmit} className={cn(frameClass, closing && "compose-sheet-closing")} data-compose-surface={mode === "popup" ? "" : undefined} style={dragY ? { transform: `translateY(${dragY}px)`, transition: "none" } : undefined} ref={formRef} role={modalMode && !minimized ? "dialog" : mode === "popup" ? "region" : undefined} aria-modal={modalMode && !minimized || undefined} aria-label={mode === "popup" ? t("compose.dialogLabel") : undefined} onKeyDown={(event) => { if (modalMode && !minimized && event.key === "Escape") { event.preventDefault(); setModalMode(false); } }} onDragEnterCapture={minimized ? undefined : onFileDragEnter} onDragOverCapture={minimized ? undefined : onFileDragOver} onDragLeaveCapture={minimized ? undefined : onFileDragLeave} onDropCapture={minimized ? undefined : onFileDrop}>
 				{draggingFiles && !minimized && (
 					<div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center border-2 border-dashed border-blue-400 bg-blue-50/90 text-sm font-medium text-blue-700" aria-hidden="true">
 						{t("compose.dropFiles")}
@@ -709,6 +862,7 @@ export function ComposeForm({
 					value={to}
 					onChange={setTo}
 					placeholder={t("compose.toPlaceholder")}
+					mailboxId={selectedMailbox?.id}
 					required
 					autoFocus={!draftIdToLoad}
 					disabled={loadingDraft}
@@ -734,6 +888,7 @@ export function ComposeForm({
 						value={cc}
 						onChange={setCc}
 						placeholder={t("compose.ccPlaceholder")}
+						mailboxId={selectedMailbox?.id}
 						disabled={loadingDraft}
 						autoFocus={!loadingDraft && cc.length === 0}
 					/>
@@ -745,6 +900,7 @@ export function ComposeForm({
 						value={bcc}
 						onChange={setBcc}
 						placeholder={t("compose.bccPlaceholder")}
+						mailboxId={selectedMailbox?.id}
 						disabled={loadingDraft}
 						autoFocus={!loadingDraft && bcc.length === 0}
 					/>
@@ -818,6 +974,40 @@ export function ComposeForm({
 								>
 									<Paperclip className="h-4 w-4" />
 								</button>
+							</Tooltip>
+							<Tooltip label={trackOpens ? t("compose.trackOpensOn") : t("compose.trackOpensOff")}>
+								<button
+									type="button"
+									aria-label={t("compose.trackOpens")}
+									aria-pressed={trackOpens}
+									onClick={() => setTrackOpens(!trackOpens)}
+									disabled={loading || loadingDraft}
+									className={cn(
+										"rounded-md p-1.5 hover:bg-neutral-100 disabled:pointer-events-none disabled:opacity-50 max-md:px-2",
+										trackOpens ? "text-blue-600 hover:text-blue-700" : "text-neutral-500 hover:text-neutral-900",
+									)}
+								>
+									{trackOpens ? <Eye className="h-4 w-4" /> : <EyeOff className="h-4 w-4" />}
+								</button>
+							</Tooltip>
+							<Tooltip label={followUpDays ? t("followUp.remindOn", { when: t(followUpOptionKey(followUpDays)) }) : t("followUp.remindMe")}>
+								<FollowUpMenu
+									disabled={loading || loadingDraft}
+									onPick={setFollowUpDays}
+									onClear={followUpDays ? () => setFollowUpDays(null) : undefined}
+									trigger={
+										<button
+											type="button"
+											aria-label={t("followUp.remindMe")}
+											className={cn(
+												"rounded-md p-1.5 hover:bg-neutral-100 disabled:pointer-events-none disabled:opacity-50 max-md:px-2",
+												followUpDays ? "text-amber-600 hover:text-amber-700" : "text-neutral-500 hover:text-neutral-900",
+											)}
+										>
+											<BellRing className="h-4 w-4" />
+										</button>
+									}
+								/>
 							</Tooltip>
 							<span className="flex-1 max-md:hidden" />
 							<Tooltip label={t("compose.deleteDraft")}>

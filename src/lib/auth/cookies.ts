@@ -1,5 +1,6 @@
 import { cookies } from "next/headers";
 import { SESSION_COOKIE, getUserFromSession } from "@/lib/auth/session";
+import { UnauthorizedError } from "./unauthorized";
 
 function getBearerToken(request?: Request): string | undefined {
 	const authorization = request?.headers.get("Authorization");
@@ -12,17 +13,17 @@ export async function getCurrentUser(env: CloudflareEnv, request?: Request) {
 	const bearerToken = getBearerToken(request);
 	if (bearerToken) {
 		const user = await getUserFromSession(env, bearerToken);
-		return user?.disabled ? null : user;
+		return user?.disabled || user?.deletedAt ? null : user;
 	}
 
 	const jar = await cookies();
 	const token = jar.get(SESSION_COOKIE)?.value;
 	const user = await getUserFromSession(env, token);
-	return user?.disabled ? null : user;
+	return user?.disabled || user?.deletedAt ? null : user;
 }
 
 export async function requireUser(env: CloudflareEnv, request?: Request) {
 	const user = await getCurrentUser(env, request);
-	if (!user) throw new Error("Unauthorized");
+	if (!user) throw new UnauthorizedError();
 	return user;
 }

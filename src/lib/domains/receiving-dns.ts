@@ -22,10 +22,10 @@ export async function listDomainMx(env: CloudflareEnv, domain: DomainRow): Promi
 	return listMxRecords(env, domain.zoneId, domain.hostname);
 }
 
-async function hasPublicMx(hostname: string, content: string): Promise<boolean | null> {
+async function hasPublicMx(hostname: string, matches: (target: string) => boolean): Promise<boolean | null> {
 	try {
 		const answers = await queryDns(hostname, "MX");
-		return answers.some((answer) => same(answer.replace(/^\d+\s+/, ""), content));
+		return answers.some((answer) => matches(answer.replace(/^\d+\s+/, "")));
 	} catch {
 		return null;
 	}
@@ -33,8 +33,13 @@ async function hasPublicMx(hostname: string, content: string): Promise<boolean |
 
 /** Whether an MX record for `content` is in the zone, or in public DNS when the zone is manual; null when it cannot be checked. */
 export async function hasMx(env: CloudflareEnv, domain: DomainRow, content: string): Promise<boolean | null> {
-	if (isManualZone(domain.zoneId)) return hasPublicMx(domain.hostname, content);
-	return (await listDomainMx(env, domain)).some((record) => same(record.content ?? "", content));
+	return hasMxMatching(env, domain, (target) => same(target, content));
+}
+
+/** Whether any MX matching `matches` is published — for providers that accept a shape of target rather than one exact host. */
+export async function hasMxMatching(env: CloudflareEnv, domain: DomainRow, matches: (target: string) => boolean): Promise<boolean | null> {
+	if (isManualZone(domain.zoneId)) return hasPublicMx(domain.hostname, matches);
+	return (await listDomainMx(env, domain)).some((record) => matches(record.content ?? ""));
 }
 
 /**
@@ -54,10 +59,12 @@ export async function publishMx(
 	if (others.length > 0 && !options.replace) {
 		throw new MxConflictError(others.map((record) => ({ content: record.content ?? "", priority: record.priority ?? 0 })));
 	}
-	for (const record of others) if (record.id) await deleteDnsRecord(env, domain.zoneId, record.id);
+	// Create the new record first: if it is rejected nothing has been deleted, so the
+	// domain keeps receiving mail where it did.
 	if (!existing.some((record) => same(record.content ?? "", content))) {
 		await createDnsRecord(env, domain.zoneId, { type: "MX", name: domain.hostname, content, priority: options.priority ?? 10, ttl: 3600 });
 	}
+	for (const record of others) if (record.id) await deleteDnsRecord(env, domain.zoneId, record.id);
 	return others;
 }
 
@@ -69,3 +76,7 @@ export async function removeMx(env: CloudflareEnv, domain: DomainRow, matches: (
 }
 
 export const isInboundSmtpMx = (content: string) => /inbound-smtp\.[a-z0-9-]+\.amazonaws\.com\.?$/i.test(content.trim());
+
+/** Resend inbound MX: the SES-style host, or the newer `receive-<region>.forge.rmta.net` host. */
+export const isResendInboundMx = (content: string) =>
+	isInboundSmtpMx(content) || /^receive-[a-z0-9-]+\.forge\.rmta\.net\.?$/i.test(content.trim());

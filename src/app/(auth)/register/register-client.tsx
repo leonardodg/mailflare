@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { AlertTriangle, ArrowRight, CheckCircle2, LoaderCircle, MailPlus, XCircle } from "lucide-react";
+import { AlertTriangle, ArrowRight, CheckCircle2, LoaderCircle, MailPlus, XCircle } from "@/components/icons";
 import { useEffect, useState } from "react";
 import { useLanguage } from "@/components/language-provider";
 import { AuthShell } from "@/components/auth/auth-shell";
@@ -48,6 +48,7 @@ export function RegisterClient() {
   const [mxCheckRevision, setMxCheckRevision] = useState(0);
   const [loading, setLoading] = useState(false);
   const [turnstileReset, setTurnstileReset] = useState(0);
+  const [usePasskey, setUsePasskey] = useState(false);
 
   useEffect(() => {
     void runPreparation();
@@ -55,23 +56,29 @@ export function RegisterClient() {
 
   const accountDomain = setupDomain ?? primaryDomain;
 
-  useEffect(() => {
-    if (step !== 3 || !accountDomain) return;
-    if (setupSkipDns) {
+  // Reset the MX check state whenever a new check starts (or DNS is skipped).
+  const [mxCheckFor, setMxCheckFor] = useState({ step, accountDomain, mxCheckRevision, setupSkipDns, t });
+  if (
+    mxCheckFor.step !== step ||
+    mxCheckFor.accountDomain !== accountDomain ||
+    mxCheckFor.mxCheckRevision !== mxCheckRevision ||
+    mxCheckFor.setupSkipDns !== setupSkipDns ||
+    mxCheckFor.t !== t
+  ) {
+    setMxCheckFor({ step, accountDomain, mxCheckRevision, setupSkipDns, t });
+    if (step === 3 && accountDomain) {
       // DNS is skipped, so there is nothing on the zone to check.
-      setMxChecking(false);
-      setMxRecordsExist(false);
+      setMxChecking(!setupSkipDns);
+      setMxRecordsExist(setupSkipDns ? false : null);
       setReplaceMxRecords(false);
       setError(null);
-      return;
     }
+  }
+
+  useEffect(() => {
+    if (step !== 3 || !accountDomain || setupSkipDns) return;
 
     let active = true;
-    setMxChecking(true);
-    setMxRecordsExist(null);
-    setReplaceMxRecords(false);
-    setError(null);
-
     void checkExistingMx(accountDomain)
       .then(({ ok, data }) => {
         if (!active) return;
@@ -125,31 +132,40 @@ export function RegisterClient() {
     setLoading(true);
     setError(null);
 
-    const hostname = String(new FormData(e.currentTarget).get("domain") ?? "").toLowerCase().trim();
-    if (skipDns) {
-      setLoading(false);
-      setSetupDomain(hostname);
-      setSetupEnableSending(true);
-      setSetupSkipDns(true);
+    try {
+      const hostname = String(new FormData(e.currentTarget).get("domain") ?? "").toLowerCase().trim();
+      if (skipDns) {
+        const { ok, data } = await submitPrimaryDomain(hostname, true);
+        if (!ok || !data.domain) {
+          setError(typeof data.error === "string" ? data.error : t("setup.domainFailed"));
+          return;
+        }
+        setSetupDomain(data.domain.hostname);
+        setSetupEnableSending(true);
+        setSetupSkipDns(true);
+        setStep(3);
+        return;
+      }
+      setSetupSkipDns(false);
+      const usedCachedCheck = domainCheck?.hostname === hostname;
+      const result: { ok: boolean; data: DomainSetupResult } = usedCachedCheck
+        ? { ok: true, data: { domain: domainCheck } }
+        : await submitPrimaryDomain(hostname);
+      const { ok, data } = result;
+      if (!ok || !data.domain) {
+        setError(
+          typeof data.error === "string" ? data.error : t("setup.domainFailed"),
+        );
+        return;
+      }
+      setSetupDomain(data.domain.hostname);
+      setSetupEnableSending(usedCachedCheck ? enableSending : false);
       setStep(3);
-      return;
+    } catch {
+      setError(t("auth.serverUnreachable"));
+    } finally {
+      setLoading(false);
     }
-    setSetupSkipDns(false);
-    const usedCachedCheck = domainCheck?.hostname === hostname;
-    const result: { ok: boolean; data: DomainSetupResult } = usedCachedCheck
-      ? { ok: true, data: { domain: domainCheck } }
-      : await submitPrimaryDomain(hostname);
-    const { ok, data } = result;
-    setLoading(false);
-    if (!ok || !data.domain) {
-      setError(
-        typeof data.error === "string" ? data.error : t("setup.domainFailed"),
-      );
-      return;
-    }
-    setSetupDomain(data.domain.hostname);
-    setSetupEnableSending(usedCachedCheck ? enableSending : false);
-    setStep(3);
   }
 
   async function onDomainBlur(e: React.FocusEvent<HTMLInputElement>) {
@@ -158,17 +174,24 @@ export function RegisterClient() {
 
     setDomainChecking(true);
     setError(null);
-    const { ok, data } = await submitPrimaryDomain(hostname);
-    setDomainChecking(false);
-    if (!ok || !data.domain) {
+    try {
+      const { ok, data } = await submitPrimaryDomain(hostname);
+      if (!ok || !data.domain) {
+        setDomainCheck(null);
+        setEnableSending(false);
+        setError(typeof data.error === "string" ? data.error : t("setup.domainCheckFailed"));
+        return;
+      }
+
+      setDomainCheck(data.domain);
+      setEnableSending(false);
+    } catch {
       setDomainCheck(null);
       setEnableSending(false);
-      setError(typeof data.error === "string" ? data.error : t("setup.domainCheckFailed"));
-      return;
+      setError(t("auth.serverUnreachable"));
+    } finally {
+      setDomainChecking(false);
     }
-
-    setDomainCheck(data.domain);
-    setEnableSending(false);
   }
 
   async function onSubmit(e: React.FormEvent<HTMLFormElement>) {
@@ -176,39 +199,46 @@ export function RegisterClient() {
     setLoading(true);
     setError(null);
 
-    const form = new FormData(e.currentTarget);
-    const domain = setupDomain ?? primaryDomain;
-    if (!domain) {
-      setLoading(false);
-      setError(t("setup.domainIncomplete"));
-      return;
-    }
+    try {
+      const form = new FormData(e.currentTarget);
+      const domain = setupDomain ?? primaryDomain;
+      if (!domain) {
+        setError(t("setup.domainIncomplete"));
+        return;
+      }
 
-    const { ok, data } = await submitRegistration(form, {
-      firstRun: true,
-      domain,
-      enableSending: setupDomain
-        ? setupEnableSending
-        : primaryDomainSendingRequested ?? undefined,
-      replaceMxRecords,
-      skipDns: setupDomain ? setupSkipDns : undefined,
-    });
-    setLoading(false);
-    if (!ok) {
-      if (data.code === "MX_RECORDS_CONFLICT") {
-        setMxRecordsExist(true);
-        setReplaceMxRecords(false);
-        setError(null);
+      const { ok, data } = await submitRegistration(form, {
+        firstRun: true,
+        domain,
+        enableSending: setupDomain
+          ? setupEnableSending
+          : primaryDomainSendingRequested ?? undefined,
+        replaceMxRecords,
+        skipDns: setupDomain ? setupSkipDns : undefined,
+      });
+      if (!ok) {
+        if (data.code === "MX_RECORDS_CONFLICT") {
+          setMxRecordsExist(true);
+          setReplaceMxRecords(false);
+          setError(null);
+          setTurnstileReset((value) => value + 1);
+          return;
+        }
+        setError(
+          data.code === "passkey_unavailable"
+            ? t("authError.passkeyUnavailable")
+            : typeof data.error === "string" ? data.error : t("setup.registrationFailed"),
+        );
         setTurnstileReset((value) => value + 1);
         return;
       }
-      setError(
-        typeof data.error === "string" ? data.error : t("setup.registrationFailed"),
-      );
+      window.location.assign(data.redirect ?? "/login");
+    } catch {
+      setError(t("auth.serverUnreachable"));
       setTurnstileReset((value) => value + 1);
-      return;
+    } finally {
+      setLoading(false);
     }
-    window.location.assign(data.redirect ?? "/login");
   }
 
   const showDomainStep = hasPrimaryDomain === false && step === 2;
@@ -405,7 +435,7 @@ export function RegisterClient() {
 							{t("setup.checkingMx")}
 						</div>
 					)}
-					{mxRecordsExist === false && (
+					{mxRecordsExist === false && !setupSkipDns && (
 						<div className="flex items-center gap-3 rounded-2xl bg-green-50 px-4 py-3 text-sm text-green-700">
 							<CheckCircle2 className="h-4 w-4" />
 							{t("setup.noMx")}
@@ -445,17 +475,31 @@ export function RegisterClient() {
               </span>
             </div>
           </div>
-          <div className="space-y-2">
-            <Label htmlFor="password">{t("auth.password")}</Label>
-            <Input
-              id="password"
-              name="password"
-              type="password"
-              minLength={8}
-              autoComplete="new-password"
-              required
+          <label className="flex cursor-pointer items-start gap-3 rounded-2xl bg-neutral-50 px-4 py-3">
+            <Checkbox
+              name="usePasskey"
+              checked={usePasskey}
+              onChange={(event) => setUsePasskey(event.target.checked)}
+              className="mt-1"
             />
-          </div>
+            <span>
+              <span className="block text-sm font-medium text-neutral-800">{t("auth.usePasskeyInstead")}</span>
+              <span className="mt-1 block text-xs leading-5 text-neutral-500">{t("auth.usePasskeyInsteadHint")}</span>
+            </span>
+          </label>
+          {!usePasskey && (
+            <div className="space-y-2">
+              <Label htmlFor="password">{t("auth.password")}</Label>
+              <Input
+                id="password"
+                name="password"
+                type="password"
+                minLength={8}
+                autoComplete="new-password"
+                required
+              />
+            </div>
+          )}
 
           <div className="space-y-2">
             <Label htmlFor="resetEmail">{t("setup.recoveryEmail")}</Label>

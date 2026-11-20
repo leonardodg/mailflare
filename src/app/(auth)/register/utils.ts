@@ -1,3 +1,4 @@
+import { readResponseJson } from "@/lib/http/response";
 import { clearClientSessionToken } from "@/lib/auth/client";
 import type {
 	DomainSetupResult,
@@ -11,27 +12,27 @@ export async function prepareSetup(): Promise<{ ok: boolean; data: SetupPreparat
 	const res = await fetch("/api/setup/prepare", { method: "POST" });
 	return {
 		ok: res.ok,
-		data: (await res.json()) as SetupPreparationResult,
+		data: (await readResponseJson(res)) as SetupPreparationResult,
 	};
 }
 
 export async function getSetupStatus(): Promise<SetupStatus> {
 	const res = await fetch("/api/setup/status");
-	const data = (await res.json()) as SetupStatus;
-	if (!res.ok) throw new Error(data.error ?? "Could not load setup status");
+	const data = (await readResponseJson(res)) as SetupStatus;
+	if (!res.ok || typeof data.hasAdminAccount !== "boolean") throw new Error(data.error ?? "Could not load setup status");
 	return data;
 }
 
-export async function submitPrimaryDomain(hostname: string): Promise<{ ok: boolean; data: DomainSetupResult }> {
+export async function submitPrimaryDomain(hostname: string, skipDns = false): Promise<{ ok: boolean; data: DomainSetupResult }> {
 	const res = await fetch("/api/setup/domain", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
-		body: JSON.stringify({ hostname }),
+		body: JSON.stringify(skipDns ? { hostname, skipDns: true } : { hostname }),
 	});
 
 	return {
 		ok: res.ok,
-		data: (await res.json()) as DomainSetupResult,
+		data: (await readResponseJson(res)) as DomainSetupResult,
 	};
 }
 
@@ -44,7 +45,7 @@ export async function checkExistingMx(hostname: string): Promise<{ ok: boolean; 
 
 	return {
 		ok: res.ok,
-		data: (await res.json()) as MxCheckResult,
+		data: (await readResponseJson(res)) as MxCheckResult,
 	};
 }
 
@@ -63,20 +64,22 @@ export async function submitRegistration(
 						replaceMxRecords: payload.replaceMxRecords,
 						skipDns: payload.skipDns,
 						username: form.get("username"),
-						password: form.get("password"),
+						password: form.get("usePasskey") === "on" ? undefined : form.get("password"),
+						usePasskey: form.get("usePasskey") === "on",
 						resetEmail: form.get("resetEmail"),
 						turnstileToken: form.get("turnstileToken"),
 					}
 				: {
 						username: form.get("username"),
-						password: form.get("password"),
+						password: form.get("usePasskey") === "on" ? undefined : form.get("password"),
+						usePasskey: form.get("usePasskey") === "on",
 						resetEmail: form.get("resetEmail"),
 						turnstileToken: form.get("turnstileToken"),
 					},
 		),
 	});
 
-	const data = (await res.json()) as RegisterResult;
+	const data = (await readResponseJson(res)) as RegisterResult;
 	if (res.ok) clearClientSessionToken();
 	return { ok: res.ok, data };
 }

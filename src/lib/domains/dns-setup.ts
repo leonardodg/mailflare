@@ -9,6 +9,8 @@ import {
 	isManualZone,
 	shouldBindEmailCatchAllToWorker,
 } from "@/lib/domains/provision";
+import { restoreMxRecordsAfterFailure } from "@/lib/domains/mx-records";
+import type { CfDnsRecord } from "@/lib/cloudflare-api.types";
 import { ensureSendingSubdomain } from "@/lib/domains/sending-subdomain";
 import type { DomainRow } from "@/lib/domains/types";
 import { isZoneApex } from "@/lib/domains/utils";
@@ -40,11 +42,16 @@ export async function setupDomainDnsRecord(
 			if (shouldBindEmailCatchAllToWorker(env)) {
 				await ensureEmailRoutingCatchAllToWorker(env, domain.zoneId);
 			}
+			const routingEnabled = result.enabled ?? true;
 			await getDb(env)
 				.update(domains)
 				.set({
-					routingEnabled: result.enabled ?? true,
+					routingEnabled,
 					routingStatus: result.status ?? domain.routingStatus,
+					// A domain added with "Skip DNS setup" starts out pending, and inbound
+					// routing only resolves active domains, so turning on receiving here
+					// has to activate it the same way domain creation does.
+					...(routingEnabled ? { status: "active" as const } : {}),
 				})
 				.where(eq(domains.id, domain.id));
 			return;
@@ -53,15 +60,25 @@ export async function setupDomainDnsRecord(
 			// The stored tag can be stale or empty even though the subdomain exists
 			// on Cloudflare, so reuse what is there instead of creating a duplicate
 			// (which Cloudflare rejects with "Subdomain already exists").
-			const { subdomain } = await ensureSendingSubdomain(env, domain.zoneId, domain.hostname, {
-				replaceMx: options.replaceMx,
-			});
+			const deletedMx: CfDnsRecord[] = [];
+			let subdomain;
+			try {
+				({ subdomain } = await ensureSendingSubdomain(env, domain.zoneId, domain.hostname, {
+					replaceMx: options.replaceMx,
+					deletedMx,
+				}));
+			} catch (error) {
+				// Replaced MX records come back if the sending subdomain still could not be created;
+				// if they cannot, that is reported rather than logged.
+				return restoreMxRecordsAfterFailure(env, domain.zoneId, deletedMx, error);
+			}
 			await getDb(env)
 				.update(domains)
 				.set({
 					sendingSubdomainTag: subdomain.tag,
 					sendingEnabled: subdomain.enabled,
 					sendingRequested: true,
+					...(subdomain.enabled ? { status: "active" as const } : {}),
 				})
 				.where(eq(domains.id, domain.id));
 			return;

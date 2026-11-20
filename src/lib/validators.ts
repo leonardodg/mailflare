@@ -1,6 +1,10 @@
 import { z } from "zod";
+import { isPublicHttpsUrl, PUBLIC_HTTPS_URL_MESSAGE } from "@/lib/security/public-url";
+import { isValidHostname, normalizeHostname } from "@/lib/domains/utils";
 import { getEmailAddress, splitEmailAddressList } from "@/lib/email/address";
 import { DEFAULT_FOLDER_COLOR, FOLDER_COLOR_VALUES } from "@/lib/folders/colors";
+import { MAX_FOLLOW_UP_DAYS } from "@/lib/follow-ups/follow-up-utils";
+import { isValidBase64 } from "@/lib/email/base64";
 
 /**
  * Recipients arrive either as one comma-separated header string (the composer)
@@ -31,12 +35,14 @@ export const sendEmailSchema = z.object({
 	mailboxId: z.string().min(1).max(200),
 	scheduledAt: z.string().datetime().optional(),
 	undoSend: z.boolean().optional(),
+	trackOpens: z.boolean().optional(),
+	followUpDays: z.number().int().min(1).max(MAX_FOLLOW_UP_DAYS).optional(),
 	attachments: z
 		.array(
 			z.object({
 					filename: z.string().min(1).max(255),
 					type: z.string().min(1).max(255).default("application/octet-stream"),
-					contentBase64: z.string().min(1).max(14 * 1024 * 1024),
+					contentBase64: z.string().min(1).max(14 * 1024 * 1024).refine(isValidBase64, "contentBase64 must be standard base64"),
 			}),
 		)
 		.max(10)
@@ -49,15 +55,25 @@ export const registerSchema = z.object({
 	name: z.string().min(1),
 });
 
-export const firstRunRegisterSchema = z.object({
-	domain: z.string().min(3),
-	enableSending: z.boolean().optional(),
-	replaceMxRecords: z.boolean().optional(),
-	skipDns: z.boolean().optional(),
-	username: z.string().min(1).max(64).regex(/^[a-zA-Z0-9._%+-]+$/),
-	password: z.string().min(8),
-	resetEmail: z.string().email(),
-});
+const hostnameField = z
+	.string()
+	.min(3)
+	.transform(normalizeHostname)
+	.refine(isValidHostname, { message: "Enter a valid domain name such as example.com" });
+
+export const firstRunRegisterSchema = z
+	.object({
+		domain: hostnameField,
+		enableSending: z.boolean().optional(),
+		replaceMxRecords: z.boolean().optional(),
+		skipDns: z.boolean().optional(),
+		username: z.string().min(1).max(64).regex(/^[a-zA-Z0-9._%+-]+$/),
+		password: z.string().min(8).optional(),
+		/** Create the first account with a passkey only; the password may be omitted. */
+		usePasskey: z.boolean().optional(),
+		resetEmail: z.string().email(),
+	})
+	.refine((value) => value.usePasskey || !!value.password, { message: "Enter a password or choose a passkey", path: ["password"] });
 
 export const primaryDomainRegisterSchema = z.object({
 	username: z.string().min(1).max(64).regex(/^[a-zA-Z0-9._%+-]+$/),
@@ -66,11 +82,13 @@ export const primaryDomainRegisterSchema = z.object({
 });
 
 export const setupDomainSchema = z.object({
-	hostname: z.string().min(3),
+	hostname: hostnameField,
+	/** Record the domain without looking it up on Cloudflare. The operator sets DNS by hand. */
+	skipDns: z.boolean().optional(),
 });
 
 export const addDomainSchema = z.object({
-	hostname: z.string().min(3),
+	hostname: hostnameField,
 	enableRouting: z.boolean().optional(),
 	enableSending: z.boolean().optional(),
 	replaceMxRecords: z.boolean().optional(),
@@ -83,7 +101,7 @@ export const addDomainSchema = z.object({
 });
 
 export const loginSchema = z.object({
-	email: z.string().email(),
+	email: z.string().trim().toLowerCase().email(),
 	password: z.string().min(1),
 });
 
@@ -98,7 +116,7 @@ export const passwordResetConfirmSchema = z.object({
 
 /** `/api/auth/device`: either email + password, or a challenge + code after MFA. */
 export const deviceLoginSchema = z.union([
-	z.object({ email: z.string().trim().email(), password: z.string().min(1), deviceName: z.string().trim().min(1).max(100) }),
+	z.object({ email: z.string().trim().toLowerCase().email(), password: z.string().min(1), deviceName: z.string().trim().min(1).max(100) }),
 	z.object({ challengeToken: z.string().min(8).max(200), code: z.string().trim().min(6).max(32), deviceName: z.string().trim().min(1).max(100) }),
 ]);
 
@@ -107,27 +125,114 @@ export const mfaVerifySchema = z.object({
 	code: z.string().trim().min(6).max(32),
 });
 
-export const mfaEnrollSchema = z.object({
-	password: z.string().min(1),
+export const passkeyCeremonySchema = z.object({
+	ceremonyToken: z.string().min(8).max(200),
+	response: z.unknown(),
 });
+
+export const passkeyMfaOptionsSchema = z.object({
+	challengeToken: z.string().min(8).max(200),
+});
+
+export const passkeyMfaVerifySchema = passkeyCeremonySchema.extend({
+	challengeToken: z.string().min(8).max(200),
+});
+
+export const stepUpActionSchema = z.enum([
+	"passkey.add",
+	"passkey.remove",
+	"password.set",
+	"password.remove",
+	"mfa.enroll",
+	"mfa.disable",
+	"mfa.codes",
+	"second_factor.toggle",
+	"admin.password_reset",
+	"admin.recovery_link",
+]);
+
+export const passkeyRegistrationSchema = passkeyCeremonySchema.extend({
+	name: z.string().trim().max(100).optional().default(""),
+	stepUpToken: z.string().min(8).max(200).optional(),
+});
+
+export const passkeySetupSchema = passkeyCeremonySchema.extend({
+	token: z.string().min(8).max(200),
+	name: z.string().trim().max(100).optional().default(""),
+});
+
+export const passkeySetupOptionsSchema = z.object({
+	token: z.string().min(8).max(200),
+});
+
+export const passkeyAddOptionsSchema = z.object({
+	stepUpToken: z.string().min(8).max(200),
+});
+
+export const passkeyStepUpSchema = z.object({
+	password: z.string().min(1).max(128),
+	code: z.string().trim().min(6).max(32).optional(),
+	action: stepUpActionSchema,
+	targetUserId: z.string().min(1).max(191).optional(),
+});
+
+export const passkeyStepUpOptionsSchema = z.object({
+	action: stepUpActionSchema,
+	targetUserId: z.string().min(1).max(191).optional(),
+});
+
+export const passkeyStepUpVerifySchema = passkeyCeremonySchema.extend({
+	action: stepUpActionSchema,
+	targetUserId: z.string().min(1).max(191).optional(),
+});
+
+export const stepUpTokenSchema = z.object({
+	stepUpToken: z.string().min(8).max(200),
+});
+
+export const passkeyRenameSchema = z.object({
+	name: z.string().trim().min(1).max(100),
+});
+
+export const passwordSetSchema = z.object({
+	newPassword: z.string().min(8).max(128),
+	stepUpToken: z.string().min(8).max(200),
+	requireSecondFactor: z.boolean().optional(),
+});
+
+export const requireSecondFactorSchema = z.object({
+	enabled: z.boolean(),
+	stepUpToken: z.string().min(8).max(200),
+});
+
+export const mfaEnrollSchema = z
+	.object({
+		password: z.string().min(1).optional(),
+		stepUpToken: z.string().min(8).max(200).optional(),
+		code: z.string().trim().min(6).max(32).optional(),
+	})
+	.refine((value) => value.password || value.stepUpToken, { message: "Verify your identity first" });
 
 export const mfaConfirmSchema = z.object({
 	code: z.string().trim().min(6).max(12),
 });
 
-export const mfaDisableSchema = z.object({
-	password: z.string().min(1),
-	code: z.string().trim().min(6).max(32),
-});
+export const mfaDisableSchema = z
+	.object({
+		password: z.string().min(1).optional(),
+		stepUpToken: z.string().min(8).max(200).optional(),
+		code: z.string().trim().min(6).max(32).optional(),
+	})
+	.refine((value) => value.password || value.stepUpToken, { message: "Verify your identity first" });
 
 export const domainSchema = z.object({
-	hostname: z.string().min(3),
+	hostname: hostnameField,
 });
 
 export const mailboxSchema = z.object({
 	domainId: z.string().min(1),
 	ownerUserId: z.string().min(1).optional(),
-	localPart: z.string().min(1).max(64),
+	localPart: z.string().min(1).max(64).regex(/^[a-zA-Z0-9._%+-]+$/),
 	displayName: z.string().optional(),
 	type: z.enum(["personal", "shared"]).optional(),
 });
@@ -139,6 +244,8 @@ export const updateManagedAccountSchema = z.object({
 	canManageMailboxes: z.boolean(),
 	canManageDomains: z.boolean().optional(),
 	canManageUsers: z.boolean().optional(),
+	calendarEnabled: z.boolean().optional(),
+	driveEnabled: z.boolean().optional(),
 	forwardingEmail: z.preprocess(
 		(value) => (typeof value === "string" ? value.trim() : value),
 		z.string().email().or(z.literal("")).nullable().optional().transform((value) => value === undefined ? undefined : value || null),
@@ -148,6 +255,8 @@ export const updateManagedAccountSchema = z.object({
 		(value) => (typeof value === "string" ? value.trim() : value),
 		z.string().min(8).max(128).or(z.literal("")).optional().transform((value) => value || null),
 	),
+	/** Required when `password` is set: the administrator must re-authenticate. */
+	stepUpToken: z.string().min(8).max(200).optional(),
 });
 
 export const createAccountSchema = z.object({
@@ -219,7 +328,8 @@ export const folderSchema = z.object({
 });
 
 export const updateProfileSchema = z.object({
-	name: z.string().trim().min(1).max(100),
+	// Optional so a recovery-email-only save leaves the name alone instead of writing back a stale one.
+	name: z.string().trim().min(1).max(100).optional(),
 	resetEmail: z.preprocess(
 		(value) => (typeof value === "string" ? value.trim() : value),
 		z.string().email().or(z.literal("")).transform((value) => value || null),
@@ -276,7 +386,8 @@ export const routingRuleSchema = z.object({
 	mailboxId: z.string().min(1),
 	folderId: z.string().optional(),
 	destination: z.string().min(1).optional(),
-	forwardTo: z.string().email().optional(),
+	forwardTo: z.string().trim().email().optional(),
+	keepCopy: z.boolean().optional(),
 	priority: z.number().int().default(0),
 });
 
@@ -335,7 +446,7 @@ export const domainRoutingRuleSchema = z
 	});
 
 export const webhookSchema = z.object({
-	url: z.string().url().max(2048),
+	url: z.string().url().max(2048).refine(isPublicHttpsUrl, PUBLIC_HTTPS_URL_MESSAGE),
 	description: z.string().trim().max(200).optional(),
 	events: z
 		.array(z.enum(["message.inbound", "message.outbound", "message.failed"]))
@@ -345,7 +456,7 @@ export const webhookSchema = z.object({
 });
 
 export const webhookUpdateSchema = z.object({
-	url: z.string().url().max(2048).optional(),
+	url: z.string().url().max(2048).refine(isPublicHttpsUrl, PUBLIC_HTTPS_URL_MESSAGE).optional(),
 	description: z.string().trim().max(200).nullish(),
 	events: z
 		.array(z.enum(["message.inbound", "message.outbound", "message.failed"]))
